@@ -44,7 +44,7 @@ richardEmail = WithEmail richard "richard@carstone.com"
 --myEmailManifest = emptyPM
 
 type MyEmailManifest = Redis
-myEmailManifest = redis info
+myEmailManifest = redis info (Just 5)
   where
     info = R.defaultConnectInfo
 

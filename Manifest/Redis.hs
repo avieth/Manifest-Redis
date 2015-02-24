@@ -26,9 +26,11 @@ import Manifest.Manifest
 
 data Redis a = Redis {
     redisConnectInfo :: R.ConnectInfo
+  , ephemeral :: Maybe Integer
+  -- ^ If Just i, keys will expire after i seconds.
   }
 
-redis :: R.ConnectInfo -> Redis a
+redis :: R.ConnectInfo -> Maybe Integer -> Redis a
 redis = Redis
 
 data RedisManifestFailure
@@ -55,35 +57,40 @@ vectToRedisValues = vectToRedisValues' 1
 
 instance Manifest Redis where
 
-  type ManifestMonad Redis = ExceptT RedisManifestFailure R.Redis
+  type ManifestMonad Redis =
+    ReaderT (Maybe Integer) (ExceptT RedisManifestFailure R.Redis)
   type PeculiarManifestFailure Redis = RedisManifestFailure
 
   manifestRead proxy (proxy' :: u n) key = do
-      hashmap <- lift (R.hgetall key)
+      hashmap <- (lift . lift) (R.hgetall key)
       case hashmap of
-        Left _ -> throwE RedisManifestWeirdResult
+        Left _ -> lift $ throwE RedisManifestWeirdResult
         Right [] -> return $ Right Nothing
         Right bss -> do
           let sorted = sortByKey bss
           case listToVect sorted of
-            Nothing -> throwE RedisManifestReadFailure
+            Nothing -> lift $ throwE RedisManifestReadFailure
             Just vect -> return $ Right (Just vect)
 
   manifestWrite proxy proxy' key valueVect = do
+      ttl <- ask
       let values = vectToRedisValues valueVect
-      result <- (lift) (R.hmset key values)
+      result <- (lift . lift) (R.hmset key values)
       case result of
-        Left _ -> throwE RedisManifestWeirdResult
-        Right R.Ok -> return ()
-        Right _ -> throwE RedisManifestWeirdResult
+        Left _ -> lift $ throwE RedisManifestWeirdResult
+        Right R.Ok -> case ttl of
+          Nothing -> return ()
+          Just i -> (lift . lift) (R.expire key i) >> return ()
+        Right _ -> lift $ throwE RedisManifestWeirdResult
 
   manifestDelete proxy proxy' key = do
+      ttl <- ask
       -- First we have to get the current key.
-      let readAction = manifestRead proxy proxy' key
-      readOutcome <- catchE readAction catchReadFailure
-      result <- (lift) (R.del [key])
+      let action = runReaderT (manifestRead proxy proxy' key) ttl
+      readOutcome <- lift $ catchE action catchReadFailure
+      result <- (lift . lift) (R.del [key])
       case result of
-        Left _ -> throwE RedisManifestWeirdResult
+        Left _ -> lift $ throwE RedisManifestWeirdResult
         Right _ -> case readOutcome of
           Right Nothing -> return $ Right Nothing
           -- ^ Key not found
@@ -97,11 +104,12 @@ instance Manifest Redis where
       catchReadFailure :: RedisManifestFailure -> ExceptT RedisManifestFailure R.Redis (Either () (Maybe (Vect BS.ByteString n)))
       catchReadFailure x = return $ Left ()
 
-  manifestRun r@(Redis connInfo) action = do
+  manifestRun r@(Redis connInfo ttl) action = do
       conn <- R.connect connInfo
       -- ^ I believe R.connect will never throw an exception; it just creates
       --   a resource pool!
-      eitherException <- try $ R.runRedis conn (runExceptT action)
+      let exceptTAction = runReaderT action ttl
+      eitherException <- try $ R.runRedis conn (runExceptT exceptTAction)
       -- ^ TODO exception handling is definitely too coarse here.
       --   Not sure how to isolate connection failures.
       case eitherException of
